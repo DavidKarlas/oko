@@ -16,8 +16,9 @@
 
 services:
   oko:
-    build: .
-    image: oko:latest
+    # Pulls the published image. Comment `image` out and uncomment `build` to run your own working tree.
+    image: davidkarlas/oko:latest
+    # build: .
     restart: unless-stopped
     ports:
       - "37008:37008/udp"   # TZSP from MikroTik and similar sensors

@@ -41,8 +41,12 @@ docker run -d --name oko \
   --network host \
   -v oko-data:/data \
   -e OKO_TOKENS=$OKO_TOKENS \
-  oko:latest
+  davidkarlas/oko:latest
 ```
+
+Published for `linux/amd64` and `linux/arm64`, so it runs on ordinary x86 servers as well as on ARM
+(Raspberry Pi, Ampere, Graviton, Apple Silicon). Pin a version for anything you care about:
+`davidkarlas/oko:0.1.1`.
 
 `--network host` is deliberate; see [the Docker note](#1-publishing-ingest-ports-through-dockers-bridge-breaks-sensor-attribution).
 
@@ -134,13 +138,20 @@ wireshark -k -i /tmp/oko
 A MikroTik speaks TZSP natively. An ordinary Linux box does not, so it pushes a pcap stream to Oko over
 TCP instead. Nothing needs to be installed beyond `tcpdump` and `socat` (or `nc`).
 
-**Use `oko-tap`** rather than assembling the pipeline yourself:
+**Use `oko-tap`** rather than assembling the pipeline yourself. It ships inside the image, so you can
+pull it out onto the machine you want to capture without cloning the repo:
 
 ```bash
-sudo tools/oko-tap/oko-tap --collector oko.example.com
+# --entrypoint is required, or the arguments go to Oko and it just starts the collector
+docker run --rm --entrypoint cat davidkarlas/oko /usr/local/share/oko/oko-tap > oko-tap
+chmod +x oko-tap
+```
+
+```bash
+sudo ./oko-tap --collector oko.example.com
 
 # persistent, restarts on failure and at boot
-sudo tools/oko-tap/oko-tap --collector oko.example.com --install-systemd
+sudo ./oko-tap --collector oko.example.com --install-systemd
 journalctl -u oko-tap -f
 ```
 
@@ -413,6 +424,25 @@ dotnet run --project tools/oko-replay -- capture.pcapng localhost 37008 --rate 0
 
 `--sensor` adds a TZSP `TAG_SENSOR`, which Oko honours in preference to the datagram's source address —
 useful for simulating several routers, and what a real sensor behind NAT would do.
+
+### Releasing
+
+```bash
+docker login                          # once, interactively
+./scripts/publish.sh --dry-run        # build both architectures, push nothing
+./scripts/publish.sh                  # version comes from Directory.Build.props
+```
+
+The script runs the tests, refuses a dirty working tree so a published tag always corresponds to a real
+commit, builds `linux/amd64` and `linux/arm64`, tags both the version and `latest`, and afterwards
+verifies that both architectures are actually present in the pushed manifest.
+
+The build **cross-compiles** rather than emulating: the SDK stage is pinned to `$BUILDPLATFORM` and
+`dotnet publish -a` targets the other architecture. Emulating an x86 SDK under QEMU on an ARM machine
+takes minutes per platform; this takes about 13 seconds each.
+
+To bump the version, edit `<OkoVersion>` in `Directory.Build.props` — it feeds the assembly version, the
+`shb_userappl` string recorded in every capture file, and the image tag.
 
 ---
 

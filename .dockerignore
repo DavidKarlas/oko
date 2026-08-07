@@ -7,5 +7,10 @@
 data/
 test/
 artifacts/
+scripts/
 *.md
 docker-compose.yml
+
+# tools/oko-tap is deliberately kept: the Dockerfile ships it inside the image so an operator can
+# extract the VM-side tap without cloning the repo.
+tools/oko-replay/
