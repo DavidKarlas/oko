@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>oko-replay</AssemblyName>
+    <RootNamespace>Oko.Replay</RootNamespace>
+  </PropertyGroup>
+
+</Project>

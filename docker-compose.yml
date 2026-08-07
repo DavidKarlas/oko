@@ -1,0 +1,68 @@
+# Oko behind Caddy, which terminates TLS and gets a certificate automatically.
+#
+# The access token travels in the URL path, so it must not cross the internet in cleartext — that is
+# what this compose file is for. Set OKO_TOKENS and OKO_DOMAIN in a .env file next to this one:
+#
+#   OKO_DOMAIN=oko.example.com
+#   OKO_TOKENS=$(uuidgen)
+#
+# Then: docker compose up -d
+#
+# NOTE ON THE INGEST PORTS: publishing them through Docker's bridge routes traffic through the userland
+# proxy, which rewrites the source address. Oko identifies senders by that address, so every router and
+# every tapped host would collapse into a single interface. This affects both ingest paths. The proxy
+# also drops UDP under burst (measured: 602 of 800 packets, against 800 of 800 over TCP). On Linux,
+# prefer host networking — see the "network_mode: host" variant commented out at the bottom.
+
+services:
+  oko:
+    build: .
+    image: oko:latest
+    restart: unless-stopped
+    ports:
+      - "37008:37008/udp"   # TZSP from MikroTik and similar sensors
+      - "37009:37009/tcp"   # inbound pcap streams from Linux hosts running oko-tap
+    volumes:
+      - oko-data:/data
+    environment:
+      OKO_TOKENS: ${OKO_TOKENS:?set OKO_TOKENS in .env, e.g. OKO_TOKENS=$(uuidgen)}
+      OKO_RETENTION_BYTES: "53687091200"     # 50 GB
+      OKO_RETENTION_DURATION: "7.00:00:00"   # 7 days
+      OKO_FLUSH_BYTES: "8388608"             # 8 MB
+      OKO_FLUSH_INTERVAL: "00:01:00"
+      OKO_SOCKET_RECEIVE_BUFFER: "8388608"
+    # Oko asks for an 8 MB socket receive buffer, but net.core.rmem_max is a global sysctl that is not
+    # namespaced, so the kernel silently clamps the request to roughly 208 KB unless the host was tuned:
+    #   sysctl -w net.core.rmem_max=16777216
+    # /status reports the buffer actually granted, and SocketDrops climbing is the symptom.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - oko
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      OKO_DOMAIN: ${OKO_DOMAIN:?set OKO_DOMAIN in .env, e.g. OKO_DOMAIN=oko.example.com}
+    command: >
+      caddy reverse-proxy --from ${OKO_DOMAIN} --to oko:8080
+
+volumes:
+  oko-data:
+  caddy-data:
+  caddy-config:
+
+# --- Linux host-networking variant -------------------------------------------------------------------
+# Replaces the "ports" mapping above and preserves each sender's real source address. Oko then listens
+# directly on the host's 37008/udp, 37009/tcp and 8080/tcp, so put Caddy in front on the host as well.
+#
+#   services:
+#     oko:
+#       network_mode: host
+#       environment:
+#         OKO_HTTP_PORT: "8080"

@@ -1,0 +1,206 @@
+#!/bin/sh
+# oko-tap — stream a host's traffic to an Oko collector using tcpdump.
+#
+# The whole point of this script rather than a hand-written pipeline: it ALWAYS adds its own exclusion
+# filter for the traffic it is itself generating. Without that, tcpdump captures the stream being sent to
+# the collector, which produces another packet, which is captured in turn — each round slightly larger,
+# until the link saturates. That loop is not a subtle degradation; it takes seconds.
+#
+# Requires: tcpdump, and one of socat or nc. Needs CAP_NET_RAW (i.e. root, in practice).
+#
+# POSIX sh on purpose, so it runs on a minimal VM with no extra runtime.
+
+set -eu
+
+COLLECTOR=""
+PORT="37009"
+INTERFACE="any"
+USER_FILTER=""
+SNAPLEN="0"
+EXCLUDE_SSH="no"
+ONCE="no"
+DRY_RUN="no"
+RETRY_DELAY="5"
+ACTION="run"
+SERVICE_NAME="oko-tap"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+
+usage() {
+    cat <<'EOF'
+usage: oko-tap --collector <host> [options]
+
+  --collector <host>   Oko collector address (required)
+  --port <port>        collector's pcap TCP port (default 37009)
+  --interface <if>     interface to capture, or "any" (default any)
+  --filter '<bpf>'     extra BPF filter, ANDed with the mandatory self-exclusion
+  --snaplen <bytes>    bytes per packet, 0 = whole packet (default 0)
+  --exclude-ssh        also exclude tcp port 22, so your own session is not captured
+  --once               do not restart the pipeline if it stops
+  --retry-delay <s>    seconds between restarts (default 5)
+  --dry-run            print the command that would run, then exit
+  --install-systemd    install and start a systemd unit with these options
+  --uninstall-systemd  stop and remove the systemd unit
+  -h, --help           this text
+
+The self-exclusion is not optional and cannot be disabled:
+
+    not (host <collector> and tcp port <port>)
+
+Notes:
+  * "--interface any" gives Linux cooked v2 (LINKTYPE_LINUX_SLL2) frames. Oko handles those over the
+    pcap TCP ingest. They cannot be sent over TZSP, which has no encapsulation code for them.
+  * A VM normally sees only its own traffic plus broadcast. To capture everything on the segment, the
+    hypervisor's virtual switch must permit promiscuous mode, or you need a mirror/SPAN port.
+
+examples:
+  oko-tap --collector oko.example.com
+  oko-tap --collector 10.0.0.5 --interface eth0 --filter 'not arp' --exclude-ssh
+  oko-tap --collector 10.0.0.5 --install-systemd
+EOF
+}
+
+die() {
+    echo "oko-tap: $*" >&2
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --collector) COLLECTOR="${2:-}"; shift 2 ;;
+        --port) PORT="${2:-}"; shift 2 ;;
+        --interface) INTERFACE="${2:-}"; shift 2 ;;
+        --filter) USER_FILTER="${2:-}"; shift 2 ;;
+        --snaplen) SNAPLEN="${2:-}"; shift 2 ;;
+        --retry-delay) RETRY_DELAY="${2:-}"; shift 2 ;;
+        --exclude-ssh) EXCLUDE_SSH="yes"; shift ;;
+        --once) ONCE="yes"; shift ;;
+        --dry-run) DRY_RUN="yes"; shift ;;
+        --install-systemd) ACTION="install"; shift ;;
+        --uninstall-systemd) ACTION="uninstall"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option '$1' (try --help)" ;;
+    esac
+done
+
+if [ "$ACTION" = "uninstall" ]; then
+    command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+    systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "$SERVICE_PATH"
+    systemctl daemon-reload
+    echo "Removed $SERVICE_PATH"
+    exit 0
+fi
+
+[ -n "$COLLECTOR" ] || die "--collector is required (try --help)"
+
+case "$PORT" in
+    ''|*[!0-9]*) die "--port must be a number, got '$PORT'" ;;
+esac
+
+# ---- build the filter ------------------------------------------------------------------------------
+# This is the safety-critical part. The exclusion is appended last and unconditionally, so no value of
+# --filter can remove it.
+EXCLUSION="not (host $COLLECTOR and tcp port $PORT)"
+
+if [ "$EXCLUDE_SSH" = "yes" ]; then
+    EXCLUSION="$EXCLUSION and not tcp port 22"
+fi
+
+if [ -n "$USER_FILTER" ]; then
+    FILTER="($USER_FILTER) and $EXCLUSION"
+else
+    FILTER="$EXCLUSION"
+fi
+
+# Defensive check: if the exclusion is somehow not in the final filter, refuse rather than risk the loop.
+case "$FILTER" in
+    *"not (host $COLLECTOR and tcp port $PORT)"*) ;;
+    *) die "internal error: the self-exclusion filter was lost; refusing to run" ;;
+esac
+
+# ---- systemd install -------------------------------------------------------------------------------
+if [ "$ACTION" = "install" ]; then
+    command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+    [ "$(id -u)" = "0" ] || die "--install-systemd needs root"
+
+    SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    INSTALLED="/usr/local/bin/oko-tap"
+    [ "$SELF" = "$INSTALLED" ] || cp "$SELF" "$INSTALLED"
+    chmod 0755 "$INSTALLED"
+
+    ARGS="--collector $COLLECTOR --port $PORT --interface $INTERFACE --snaplen $SNAPLEN --once"
+    [ -n "$USER_FILTER" ] && ARGS="$ARGS --filter '$USER_FILTER'"
+    [ "$EXCLUDE_SSH" = "yes" ] && ARGS="$ARGS --exclude-ssh"
+
+    cat > "$SERVICE_PATH" <<EOF
+[Unit]
+Description=Oko tap (tcpdump -> $COLLECTOR:$PORT)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --once because systemd owns the restarting; a retry loop inside the unit would hide failures from it.
+ExecStart=/bin/sh -c "exec $INSTALLED $ARGS"
+Restart=always
+RestartSec=$RETRY_DELAY
+# tcpdump only needs packet capture rights, not full root.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE_NAME"
+    echo "Installed and started $SERVICE_NAME."
+    echo "  journalctl -u $SERVICE_NAME -f"
+    exit 0
+fi
+
+# ---- dependencies ----------------------------------------------------------------------------------
+command -v tcpdump >/dev/null 2>&1 || die "tcpdump not found; install it (apt install tcpdump)"
+
+if command -v socat >/dev/null 2>&1; then
+    SINK="socat - TCP:$COLLECTOR:$PORT"
+elif command -v nc >/dev/null 2>&1; then
+    # nc is more widely present than socat but its flags vary between the BSD, GNU and OpenBSD builds,
+    # so the plain two-argument form is used deliberately.
+    SINK="nc $COLLECTOR $PORT"
+else
+    die "neither socat nor nc found; install one (apt install socat)"
+fi
+
+# -U writes each packet through as it arrives. Without it tcpdump buffers ~4 KB and a live view stalls.
+TCPDUMP="tcpdump -i $INTERFACE -U -s $SNAPLEN -w - $(printf '%s' "$FILTER" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")"
+
+if [ "$DRY_RUN" = "yes" ]; then
+    printf '%s | %s\n' "$TCPDUMP" "$SINK"
+    exit 0
+fi
+
+if [ "$(id -u)" != "0" ]; then
+    echo "oko-tap: warning: not running as root; tcpdump needs CAP_NET_RAW and will probably fail" >&2
+fi
+
+echo "oko-tap: capturing $INTERFACE -> $COLLECTOR:$PORT" >&2
+echo "oko-tap: filter: $FILTER" >&2
+
+run_once() {
+    # shellcheck disable=SC2086
+    tcpdump -i "$INTERFACE" -U -s "$SNAPLEN" -w - "$FILTER" | $SINK
+}
+
+if [ "$ONCE" = "yes" ]; then
+    run_once
+else
+    while true; do
+        run_once || echo "oko-tap: pipeline exited; retrying in ${RETRY_DELAY}s" >&2
+        sleep "$RETRY_DELAY"
+    done
+fi
