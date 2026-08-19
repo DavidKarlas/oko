@@ -34,9 +34,24 @@ Prefer the TCP path where you have the choice: TCP does not lose packets under b
 
 ## Quick start
 
+**On macOS or Windows** (Docker Desktop), and for trying it out anywhere:
+
 ```bash
 export OKO_TOKENS=$(uuidgen)
 
+docker run -d --name oko \
+  -p 8080:8080 \
+  -p 37008:37008/udp \
+  -p 37009:37009/tcp \
+  -v oko-data:/data \
+  -e OKO_TOKENS=$OKO_TOKENS \
+  davidkarlas/oko:latest
+```
+
+**On a Linux server, for real deployments**, use host networking instead — it preserves each sender's
+source address, which is what per-sensor attribution depends on, and avoids the proxy that drops UDP:
+
+```bash
 docker run -d --name oko \
   --network host \
   -v oko-data:/data \
@@ -44,11 +59,24 @@ docker run -d --name oko \
   davidkarlas/oko:latest
 ```
 
+> **`--network host` does not work on Docker Desktop.** Docker runs inside a Linux VM there, so "host"
+> means *the VM's* network, not your Mac or PC. The container starts and reports healthy, but nothing is
+> reachable on `127.0.0.1` — which looks exactly like Oko failing to listen. Use the published-ports
+> form above. (Docker Desktop 4.34+ has a host-networking beta under Settings → Resources → Network, off
+> by default.)
+
+Either way, check it is up:
+
+```bash
+curl http://127.0.0.1:8080/healthz     # -> ok
+```
+
 Published for `linux/amd64` and `linux/arm64`, so it runs on ordinary x86 servers as well as on ARM
 (Raspberry Pi, Ampere, Graviton, Apple Silicon). Pin a version for anything you care about:
 `davidkarlas/oko:0.1.1`.
 
-`--network host` is deliberate; see [the Docker note](#1-publishing-ingest-ports-through-dockers-bridge-breaks-sensor-attribution).
+Why host networking matters on Linux: see
+[the Docker note](#1-publishing-ingest-ports-through-dockers-bridge-breaks-sensor-attribution).
 
 Then point something at it. A MikroTik:
 
@@ -310,6 +338,10 @@ arbitrary.
 
 **On Linux, use `--network host`** (or `network_mode: host`). The sender's real address survives and
 there is no proxy in the path.
+
+On **Docker Desktop** (macOS/Windows) host networking is not an option — "host" there is the Linux VM,
+not your machine, so the container becomes unreachable from `127.0.0.1`. Publish the ports instead and
+accept the rewritten addresses; for local testing that is fine.
 
 ### 2. The same proxy drops UDP, which is a reason to prefer the TCP path
 
