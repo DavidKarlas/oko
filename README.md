@@ -163,8 +163,13 @@ History-follow downloads contain a historical pcapng section followed by a live 
 has its own interface descriptions, so sensors discovered while history is being downloaded remain
 correctly attributed. Wireshark reads both sections as one capture.
 
-If a live reader falls behind and fills its queue, Oko counts the rejected batch in
-`Live.DroppedBatches`, detaches that reader, and aborts its HTTP response. A client such as `curl`
+`capinfos` reports interface summaries separately for each section. The same sensor can therefore
+appear with different counts, including zero, in those summaries; that alone does not indicate missing
+packets. Use the overall packet count and Wireshark's per-packet interface attribution when checking a
+history-follow capture.
+
+If a live reader falls behind and fills its queue, Oko increments `Live.DroppedBatches` once,
+detaches that reader, and aborts its HTTP response. A client such as `curl`
 reports a transfer error; any saved prefix is an incomplete capture. Download the interval again using
 a bounded history route such as `/last/10m`. Ingestion and other live readers continue normally.
 
@@ -411,6 +416,14 @@ Counters shared by both ingest paths:
 - `Memory.PendingFlushBytes` — data waiting to be written. Sustained growth means storage is not
   keeping up with ingest.
 - `Storage.OldestUtc` — how far back you can actually query.
+
+Live readers:
+
+- `Live.Subscribers` — currently attached live readers.
+- `Live.DroppedBatches` — readers terminated by queue overflow since startup. The field name is kept
+  for compatibility: each reader is removed on its first rejected batch, so the counter increments
+  once per terminated reader. It does **not** measure the total batches or packets missing from the
+  client's incomplete capture.
 
 TZSP / UDP path:
 

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Threading.Channels;
 using Oko.Pcapng;
 
@@ -56,6 +57,10 @@ internal sealed class LiveHub
         }
     }
 
+    /// <summary>
+    /// Readers terminated by queue overflow since startup. The historical name is retained for the
+    /// status API; each reader is detached at its first rejection, so this is not a total loss count.
+    /// </summary>
     public long DroppedBatches => Interlocked.Read(ref _droppedBatches);
 
     /// <summary>
@@ -236,10 +241,18 @@ internal sealed record LiveBatch(byte[] Bytes, ulong[] PacketSequences)
         for (int offset = 0; offset < Bytes.Length;)
         {
             ReadOnlySpan<byte> block = Bytes.AsSpan(offset);
+            Debug.Assert(block.Length >= PcapngReader.MinimumBlockLength,
+                "Internally generated live batches must contain complete block headers and trailers.");
             int length = checked((int)PcapngReader.ReadBlockTotalLength(block));
+            Debug.Assert(length >= PcapngReader.MinimumBlockLength && length % 4 == 0 && length <= block.Length,
+                "Each live block must have a positive, aligned length within the remaining batch.");
             bool coveredByHistory = false;
             if (PcapngReader.ReadBlockType(block) == BlockType.EnhancedPacket)
             {
+                Debug.Assert(length >= PcapngReader.EnhancedPacketFieldsLength + sizeof(uint),
+                    "Packet blocks must contain the packet fields and trailing length.");
+                Debug.Assert(packet < PacketSequences.Length,
+                    "Every packet block must have a corresponding sequence number.");
                 ulong timestamp = PcapngReader.ReadEnhancedPacketTimestamp(block);
                 coveredByHistory = PacketSequences[packet++] <= lastHistorySequence &&
                     timestamp >= fromNanoseconds && timestamp <= toNanoseconds;
@@ -252,6 +265,9 @@ internal sealed record LiveBatch(byte[] Bytes, ulong[] PacketSequences)
 
             offset += length;
         }
+
+        Debug.Assert(packet == PacketSequences.Length,
+            "The sequence count must equal the number of packet blocks in the batch.");
     }
 }
 
@@ -283,6 +299,7 @@ internal sealed class LiveSubscription : IDisposable
 
     private long _droppedBatches;
 
+    /// <summary>Zero until this reader overflows, then one; subsequent batches are no longer offered.</summary>
     public long DroppedBatches => Interlocked.Read(ref _droppedBatches);
 
     public ChannelReader<LiveBatch> Batches => _batches.Reader;

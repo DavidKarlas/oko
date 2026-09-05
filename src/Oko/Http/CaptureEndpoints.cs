@@ -219,8 +219,7 @@ internal static class CaptureEndpoints
             catch (LiveStreamOverflowException)
             {
                 logger.LogWarning(
-                    "Aborting incomplete live capture after {Count} rejected batch(es). Download history to recover.",
-                    subscription.DroppedBatches);
+                    "Aborting incomplete live capture because its queue overflowed. Download history to recover.");
                 // The response already started; a clean EOF would falsely claim a successful download.
                 context.Abort();
             }
