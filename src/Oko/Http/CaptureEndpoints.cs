@@ -70,7 +70,7 @@ internal static class CaptureEndpoints
     }
 
     /// <summary>An empty window: /live sends nothing historical, only what arrives from now on.</summary>
-    private static Func<DateTime, TimeWindow> LiveOnly => now => new TimeWindow(now, now, null);
+    private static Func<DateTime, TimeWindow> LiveOnly => now => new TimeWindow(now, now, null, IncludeHistory: false);
 
     private static Func<DateTime, TimeWindow> ParseLast(string duration) => now =>
         TimeParsing.TryParseDuration(duration, out TimeSpan window)
@@ -103,7 +103,7 @@ internal static class CaptureEndpoints
             : new TimeWindow(fromUtc, toUtc, null);
     };
 
-    internal sealed record TimeWindow(DateTime FromUtc, DateTime ToUtc, string? Error);
+    internal sealed record TimeWindow(DateTime FromUtc, DateTime ToUtc, string? Error, bool IncludeHistory = true);
 
     /// <summary>Serves a capture response: history from the store, then optionally live packets.</summary>
     internal sealed class CaptureService(
@@ -150,12 +150,15 @@ internal static class CaptureEndpoints
                 PrepareResponse(context, window, follow);
                 PipeWriter output = context.Response.BodyWriter;
 
-                writer.WritePreamble(output, PcapngResponseWriter.DescribeQuery(window.FromUtc, window.ToUtc, follow));
-                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-                long bytes = await writer
-                    .WriteSnapshotAsync(output, snapshot, window.FromUtc, window.ToUtc, cancellationToken)
-                    .ConfigureAwait(false);
+                long bytes = 0;
+                if (window.IncludeHistory)
+                {
+                    writer.WritePreamble(output, PcapngResponseWriter.DescribeQuery(window.FromUtc, window.ToUtc, follow));
+                    await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    bytes = await writer
+                        .WriteSnapshotAsync(output, snapshot, window.FromUtc, window.ToUtc, cancellationToken)
+                        .ConfigureAwait(false);
+                }
 
                 logger.LogInformation(
                     "Served {Bytes} bytes of history for {From:o}..{To:o} ({Segments} segment(s)){Follow}.",
@@ -167,7 +170,7 @@ internal static class CaptureEndpoints
 
                 if (subscription is not null)
                 {
-                    await FollowAsync(output, subscription, snapshot.LastSequence, cancellationToken)
+                    await FollowAsync(context, output, subscription, snapshot.LastSequence, window, cancellationToken)
                         .ConfigureAwait(false);
                 }
             }
@@ -179,26 +182,29 @@ internal static class CaptureEndpoints
         /// Streams live batches until the client disconnects, skipping anything already emitted as
         /// history.
         /// </summary>
-        private async Task FollowAsync(
+        internal async Task FollowAsync(
+            HttpContext context,
             PipeWriter output,
             LiveSubscription subscription,
             ulong lastHistorySequence,
+            TimeWindow window,
             CancellationToken cancellationToken)
         {
             try
             {
+                // Live has its own pcapng section and the exact table captured when subscribing.
+                // History may already know newer interfaces; mixing those tables in one section would
+                // duplicate inline announcements and shift interface IDs.
+                output.Write(subscription.Preamble);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+                ulong fromNanoseconds = MonotonicClock.ToNanoseconds(window.FromUtc);
+                ulong toNanoseconds = MonotonicClock.ToNanoseconds(window.ToUtc);
                 await foreach (LiveBatch batch in subscription.Batches.ReadAllAsync(cancellationToken)
                     .ConfigureAwait(false))
                 {
-                    // A batch entirely older than the history boundary was already sent. Partial overlap
-                    // cannot happen: the subscription was created before the snapshot was taken, so the
-                    // first batch it can receive starts at or after the snapshot's last sequence.
-                    if (batch.LastSequence <= lastHistorySequence)
-                    {
-                        continue;
-                    }
-
-                    output.Write(batch.Bytes);
+                    batch.WriteExcludingHistory(output, window.IncludeHistory ? lastHistorySequence : 0,
+                        fromNanoseconds, toNanoseconds);
                     FlushResult result = await output.FlushAsync(cancellationToken).ConfigureAwait(false);
                     if (result.IsCompleted || result.IsCanceled)
                     {
@@ -210,12 +216,12 @@ internal static class CaptureEndpoints
             {
                 // The client hung up, which is the normal way a live stream ends.
             }
-
-            if (subscription.DroppedBatches > 0)
+            catch (LiveStreamOverflowException)
             {
                 logger.LogWarning(
-                    "Dropped {Count} batch(es) for a live subscriber that could not keep up.",
-                    subscription.DroppedBatches);
+                    "Aborting incomplete live capture because its queue overflowed. Download history to recover.");
+                // The response already started; a clean EOF would falsely claim a successful download.
+                context.Abort();
             }
         }
 

@@ -159,6 +159,20 @@ wireshark -k -i /tmp/oko
 
 `curl -N` matters for live streams — without it curl buffers and Wireshark shows nothing for a while.
 
+History-follow downloads contain a historical pcapng section followed by a live section. Each section
+has its own interface descriptions, so sensors discovered while history is being downloaded remain
+correctly attributed. Wireshark reads both sections as one capture.
+
+`capinfos` reports interface summaries separately for each section. The same sensor can therefore
+appear with different counts, including zero, in those summaries; that alone does not indicate missing
+packets. Use the overall packet count and Wireshark's per-packet interface attribution when checking a
+history-follow capture.
+
+If a live reader falls behind and fills its queue, Oko increments `Live.DroppedBatches` once,
+detaches that reader, and aborts its HTTP response. A client such as `curl`
+reports a transfer error; any saved prefix is an incomplete capture. Download the interval again using
+a bounded history route such as `/last/10m`. Ingestion and other live readers continue normally.
+
 ---
 
 ## Capturing from a Linux host or VM
@@ -403,6 +417,14 @@ Counters shared by both ingest paths:
   keeping up with ingest.
 - `Storage.OldestUtc` — how far back you can actually query.
 
+Live readers:
+
+- `Live.Subscribers` — currently attached live readers.
+- `Live.DroppedBatches` — readers terminated by queue overflow since startup. The field name is kept
+  for compatibility: each reader is removed on its first rejected batch, so the counter increments
+  once per terminated reader. It does **not** measure the total batches or packets missing from the
+  client's incomplete capture.
+
 TZSP / UDP path:
 
 - `Ingest.SocketDrops` — kernel-dropped datagrams. Should be `0`. `null` means not Linux.
@@ -431,6 +453,18 @@ dotnet test
 
 The test suite spawns the built `Oko` executable and drives it over real UDP, real TCP and HTTP, so build
 before running the integration tests.
+
+`LiveStreamingTests` deterministically covers history/live batch overlap, reversed publication order,
+interface discovery, and queue overflow, including a real HTTP client observing an aborted response.
+`LiveTcpEndToEndTests` checks concurrent Ethernet and Linux-cooked TCP senders against history-follow
+and live-only HTTP readers, validating the resulting captures with Wireshark. Run the focused tests with:
+
+```bash
+dotnet test -- --filter-class 'Oko.Tests.Live*'
+```
+
+Wireshark-dependent tests skip when `tshark` or `capinfos` is missing; check the skipped count before
+treating a run as complete. The repository does not currently configure a line/branch coverage report.
 
 ### Tools
 
