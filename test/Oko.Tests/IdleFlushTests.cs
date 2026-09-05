@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
 using Oko;
 using Oko.Capture;
 using Oko.Pcapng;
@@ -41,7 +42,7 @@ public class IdleFlushTests : IDisposable
         store.Append(0, clock.NextTimestampNanoseconds(), TestFrames.Udp(100), 100);
 
         Assert.False(
-            store.SealActiveIfOlderThan(TimeSpan.FromMinutes(1), DateTime.UtcNow),
+            store.SealActiveIfOlderThan(TimeSpan.FromMinutes(1)),
             "a block holding fresh data should not be sealed early");
         Assert.Equal(0, store.GetMemoryStats().SealedBlocks);
     }
@@ -50,13 +51,14 @@ public class IdleFlushTests : IDisposable
     public void SealActiveIfOlderThanSealsStaleData()
     {
         OkoOptions options = TestOptions.Create(_directory);
-        var store = new CaptureStore(options, NullLogger<CaptureStore>.Instance);
+        var time = new FakeTimeProvider();
+        var store = new CaptureStore(options, NullLogger<CaptureStore>.Instance, time);
         var clock = new MonotonicClock();
 
         store.Append(0, clock.NextTimestampNanoseconds(), TestFrames.Udp(100), 100);
 
-        // Look at the block from a point far enough in the future that its oldest packet is stale.
-        Assert.True(store.SealActiveIfOlderThan(TimeSpan.FromSeconds(1), DateTime.UtcNow.AddMinutes(5)));
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.True(store.SealActiveIfOlderThan(TimeSpan.FromSeconds(1)));
         Assert.Equal(1, store.GetMemoryStats().SealedBlocks);
         Assert.Equal(0, store.GetMemoryStats().ActiveBytes);
     }
@@ -67,7 +69,7 @@ public class IdleFlushTests : IDisposable
         OkoOptions options = TestOptions.Create(_directory);
         var store = new CaptureStore(options, NullLogger<CaptureStore>.Instance);
 
-        Assert.False(store.SealActiveIfOlderThan(TimeSpan.Zero, DateTime.UtcNow.AddYears(1)));
+        Assert.False(store.SealActiveIfOlderThan(TimeSpan.Zero));
         Assert.Equal(0, store.GetMemoryStats().SealedBlocks);
     }
 

@@ -35,6 +35,12 @@ internal sealed class CaptureBlock
     /// <summary>Sequence number of the last packet in this block.</summary>
     public ulong LastSequence { get; private set; }
 
+    /// <summary>
+    /// Collector clock tick at the first append, used only for flush scheduling. Unlike packet
+    /// timestamps this is monotonic, has no UTC meaning, and is not written into the capture.
+    /// </summary>
+    public long FirstArrivalTimestamp { get; private set; }
+
     /// <summary>Oldest timestamp in this block. A true minimum, not the first one appended.</summary>
     public ulong EarliestTimestampNanoseconds { get; private set; }
 
@@ -55,7 +61,8 @@ internal sealed class CaptureBlock
         ulong timestampNanoseconds,
         ReadOnlySpan<byte> frame,
         uint originalLength,
-        ulong sequence)
+        ulong sequence,
+        long arrivalTimestamp)
     {
         int required = PcapngWriter.EnhancedPacketSize(frame.Length);
         if (Length + required > _buffer.Length)
@@ -73,6 +80,7 @@ internal sealed class CaptureBlock
         if (PacketCount == 0)
         {
             FirstSequence = sequence;
+            FirstArrivalTimestamp = arrivalTimestamp;
             EarliestTimestampNanoseconds = timestampNanoseconds;
             LatestTimestampNanoseconds = timestampNanoseconds;
         }

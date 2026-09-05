@@ -58,9 +58,10 @@ internal sealed class CaptureStore
     private long _pendingFlushBytes;
     private bool _warnedAboutPendingFlush;
 
-    public CaptureStore(OkoOptions options, ILogger<CaptureStore> logger)
+    public CaptureStore(OkoOptions options, ILogger<CaptureStore> logger, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
+        TimeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
         _blockBytes = options.BlockBytes;
         _index = SegmentIndex.Rebuild(options.SegmentsDirectory, logger);
@@ -69,6 +70,9 @@ internal sealed class CaptureStore
 
     /// <summary>Sealed blocks awaiting a segment write. Drained by <see cref="SegmentWriter"/>.</summary>
     public ChannelReader<CaptureBlock> FlushQueue => _flushQueue.Reader;
+
+    /// <summary>The collector clock, shared with the writer's flush timers.</summary>
+    public TimeProvider TimeProvider { get; }
 
     /// <summary>Number assigned to the next segment file, for unique file names.</summary>
     public long NextSegmentNumber()
@@ -90,12 +94,13 @@ internal sealed class CaptureStore
         lock (_gate)
         {
             ulong sequence = _nextSequence++;
+            long arrivalTimestamp = TimeProvider.GetTimestamp();
 
-            if (!_active.TryAppend(interfaceId, timestampNanoseconds, frame, originalLength, sequence))
+            if (!_active.TryAppend(interfaceId, timestampNanoseconds, frame, originalLength, sequence, arrivalTimestamp))
             {
                 SealActiveLocked();
 
-                if (!_active.TryAppend(interfaceId, timestampNanoseconds, frame, originalLength, sequence))
+                if (!_active.TryAppend(interfaceId, timestampNanoseconds, frame, originalLength, sequence, arrivalTimestamp))
                 {
                     // Unreachable: OkoOptions enforces a block size larger than the biggest possible EPB.
                     throw new InvalidOperationException(
@@ -120,15 +125,14 @@ internal sealed class CaptureStore
     }
 
     /// <summary>
-    /// Seals the active block if its oldest packet is older than <paramref name="maximumAge"/>.
+    /// Seals the active block once <paramref name="maximumAge"/> has elapsed since its first append.
     /// </summary>
     /// <remarks>
-    /// Without this, the flush interval would only start once a block filled, so a link too slow to
-    /// fill a 1 MB block would hold everything in memory indefinitely and lose it all on a crash —
-    /// exactly the "leave it running at a remote site" case Oko exists for.
+    /// Uses the collector's monotonic clock, not the sender's packet timestamps: replayed captures,
+    /// sender clock skew and local wall-clock adjustments must not change the persistence deadline.
     /// </remarks>
     /// <returns>Whether a block was sealed.</returns>
-    public bool SealActiveIfOlderThan(TimeSpan maximumAge, DateTime nowUtc)
+    public bool SealActiveIfOlderThan(TimeSpan maximumAge)
     {
         lock (_gate)
         {
@@ -137,8 +141,7 @@ internal sealed class CaptureStore
                 return false;
             }
 
-            DateTime oldest = MonotonicClock.ToUtc(_active.EarliestTimestampNanoseconds);
-            if (nowUtc - oldest < maximumAge)
+            if (TimeProvider.GetElapsedTime(_active.FirstArrivalTimestamp) < maximumAge)
             {
                 return false;
             }
