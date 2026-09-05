@@ -104,7 +104,6 @@ internal sealed class SegmentWriter(
 
             if (await TryWriteSegmentAsync(_pending).ConfigureAwait(false))
             {
-                _pending.Clear();
                 continue;
             }
 
@@ -195,26 +194,24 @@ internal sealed class SegmentWriter(
         }
 
         logger.LogInformation("Flushing {Count} pending block(s) before shutdown.", pending.Count);
-        if (await TryWriteSegmentAsync(pending).ConfigureAwait(false))
-        {
-            pending.Clear();
-        }
-        else
+        if (!await TryWriteSegmentAsync(pending).ConfigureAwait(false))
         {
             logger.LogError("Shutdown flush failed; {Count} block(s) remain only in memory.", pending.Count);
         }
     }
 
     /// <summary>
-    /// Writes one segment without cancellation, allowing in-flight I/O to finish during graceful
-    /// shutdown. Only complete files are renamed into place. A forced process exit or storage failure
-    /// can still lose memory-only data; the host's shutdown timeout does not guarantee a disk flush.
+    /// Writes one segment and clears the committed blocks from the pending list before logging.
+    /// Runs without cancellation, allowing in-flight I/O to finish during graceful shutdown. Only
+    /// complete files are renamed into place. A forced process exit or storage failure can still lose
+    /// memory-only data; the host's shutdown timeout does not guarantee a disk flush.
     /// </summary>
     private async Task<bool> TryWriteSegmentAsync(List<CaptureBlock> blocks)
     {
         List<CaptureBlock> populated = [.. blocks.Where(block => block.PacketCount > 0)];
         if (populated.Count == 0)
         {
+            blocks.Clear();
             return true;
         }
 
@@ -263,6 +260,9 @@ internal sealed class SegmentWriter(
 
         long size = new FileInfo(path).Length;
         store.CompleteFlush(populated, new SegmentRef(path, startUtc, endUtc, size, number));
+        // Committed blocks must no longer be eligible for the shutdown drain, even if a logging
+        // provider throws below. The separate populated list still supplies the log's packet count.
+        blocks.Clear();
 
         logger.LogInformation(
             "Wrote {Path} ({Bytes} bytes, {Packets} packets, {Start:HH:mm:ss.fff}-{End:HH:mm:ss.fff}Z).",

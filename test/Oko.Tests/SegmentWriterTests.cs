@@ -255,6 +255,45 @@ public class SegmentWriterTests : IDisposable
     }
 
     [Fact]
+    public async Task StopDoesNotRewriteACommittedSegmentWhenSuccessLoggingThrowsAsync()
+    {
+        OkoOptions options = TestOptions.Create(_directory);
+        var time = new WriterTimeProvider();
+        var store = new CaptureStore(options, NullLogger<CaptureStore>.Instance, time);
+        var interfaces = new InterfaceTable(options.InterfacesPath);
+        using var logger = new PausedWriteLogger(throwOnRelease: true);
+        using var writer = new SegmentWriter(options, store, interfaces, logger);
+        uint sensor = interfaces.Resolve(IPAddress.Loopback, LinkType.Ethernet).Id;
+
+        await writer.StartAsync(CancellationToken.None);
+        try
+        {
+            await time.WaitForTimerAsync();
+            store.Append(sensor, MonotonicClock.ToNanoseconds(time.GetUtcNow().UtcDateTime), TestFrames.Udp(100), 100);
+            time.Advance(options.FlushInterval);
+            await logger.Written.Task.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+            Assert.Equal(1, store.GetStorageStats().Segments);
+
+            // Fail after publishing the segment. Stop must not mistake its committed blocks for
+            // unwritten data, even though BackgroundService.StopAsync suppresses the worker fault.
+            logger.Release();
+            await writer.StopAsync(CancellationToken.None);
+            Assert.True(writer.ExecuteTask!.IsFaulted);
+
+            string path = Assert.Single(store.Snapshot(DateTime.MinValue, DateTime.MaxValue).Segments).Path;
+            Assert.Single(Directory.EnumerateFiles(options.SegmentsDirectory, "*.pcapng", SearchOption.AllDirectories));
+            Wireshark.AssertFileIsValid(path);
+            Assert.Equal(["100"], Wireshark.ReadField(path, "frame.len"));
+            Assert.Equal(new MemoryStats(0, 0, 0, 0), store.GetMemoryStats());
+        }
+        finally
+        {
+            logger.Release();
+            await writer.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task TimedOutStopDoesNotDrainAlongsideAnInFlightWriteAsync()
     {
         OkoOptions options = TestOptions.Create(_directory);
@@ -274,8 +313,8 @@ public class SegmentWriterTests : IDisposable
             time.Advance(options.FlushInterval);
             await logger.Written.Task.WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
 
-            // The first segment is committed but the worker has not cleared its pending list. A
-            // second drain at this point would duplicate that packet and race the queue's reader.
+            // The first segment is committed but the worker has not exited. Shutdown must wait for
+            // it before transferring ownership of the queue and pending list to the final drain.
             store.Append(sensor, timestamp, TestFrames.Udp(120), 120);
             store.SealActive();
             store.Append(sensor, timestamp, TestFrames.Udp(140), 140);
@@ -351,7 +390,7 @@ public class SegmentWriterTests : IDisposable
         }
     }
 
-    private sealed class PausedWriteLogger : ILogger<SegmentWriter>, IDisposable
+    private sealed class PausedWriteLogger(bool throwOnRelease = false) : ILogger<SegmentWriter>, IDisposable
     {
         private readonly ManualResetEventSlim _release = new();
 
@@ -368,6 +407,11 @@ public class SegmentWriterTests : IDisposable
                 if (!_release.Wait(TimeSpan.FromSeconds(10)))
                 {
                     throw new TimeoutException("The test did not release the paused writer.");
+                }
+
+                if (throwOnRelease)
+                {
+                    throw new InvalidOperationException("The test logger failed after the segment was committed.");
                 }
             }
         }
