@@ -40,6 +40,8 @@ builder.Services.AddSingleton(provider => new UdpDropReader(
 builder.Services.AddSingleton<TokenAuthenticator>();
 builder.Services.AddSingleton<TokenAuthFilter>();
 builder.Services.AddSingleton<StatusReporter>();
+builder.Services.AddSingleton<WriterMetrics>();
+builder.Services.AddSingleton<MetricsReporter>();
 builder.Services.AddSingleton<PcapngResponseWriter>();
 builder.Services.AddSingleton<CaptureEndpoints.CaptureService>();
 
@@ -58,6 +60,9 @@ var app = builder.Build();
 app.MapGet("/healthz", () => Results.Text("ok\n", "text/plain"));
 
 app.MapCaptureEndpoints();
+app.MapGet("/metrics", (MetricsReporter reporter) =>
+        Results.Text(reporter.Build(), "text/plain; version=0.0.4; charset=utf-8"))
+    .AddEndpointFilter<TokenAuthFilter>();
 
 await app.RunAsync();
 return 0;

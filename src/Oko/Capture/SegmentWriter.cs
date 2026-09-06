@@ -18,7 +18,8 @@ internal sealed class SegmentWriter(
     OkoOptions options,
     CaptureStore store,
     InterfaceTable interfaces,
-    ILogger<SegmentWriter> logger) : BackgroundService
+    ILogger<SegmentWriter> logger,
+    WriterMetrics? metrics = null) : BackgroundService
 {
     /// <summary>How long to wait before retrying after a failed write.</summary>
     private static readonly TimeSpan WriteRetryDelay = TimeSpan.FromSeconds(5);
@@ -222,6 +223,7 @@ internal sealed class SegmentWriter(
         string path = SegmentIndex.BuildPath(options.SegmentsDirectory, startUtc, endUtc, number);
         string temporaryPath = SegmentIndex.ToTemporaryPath(path);
 
+        long writeStarted = Stopwatch.GetTimestamp();
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -249,6 +251,7 @@ internal sealed class SegmentWriter(
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
+            metrics?.RecordFailure();
             logger.LogError(
                 exception,
                 "Failed to write segment {Path}. Capture data remains in memory.",
@@ -263,6 +266,7 @@ internal sealed class SegmentWriter(
         // Committed blocks must no longer be eligible for the shutdown drain, even if a logging
         // provider throws below. The separate populated list still supplies the log's packet count.
         blocks.Clear();
+        metrics?.RecordSuccess(size, Stopwatch.GetElapsedTime(writeStarted).TotalSeconds);
 
         logger.LogInformation(
             "Wrote {Path} ({Bytes} bytes, {Packets} packets, {Start:HH:mm:ss.fff}-{End:HH:mm:ss.fff}Z).",
