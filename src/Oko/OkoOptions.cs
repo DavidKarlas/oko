@@ -38,7 +38,10 @@ internal sealed class OkoOptions
     /// <summary>Accumulated bytes that trigger a segment flush.</summary>
     public long FlushBytes { get; private init; } = 8 * 1024 * 1024;
 
-    /// <summary>Upper bound on how long data may sit in memory, so an idle link still reaches disk.</summary>
+    /// <summary>
+    /// Target time from first collector arrival to a segment write, plus idle polling and I/O latency.
+    /// Storage failures can delay persistence beyond this interval.
+    /// </summary>
     public TimeSpan FlushInterval { get; private init; } = TimeSpan.FromMinutes(1);
 
     public int BlockBytes { get; private init; } = 1024 * 1024;

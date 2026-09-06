@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading.Channels;
 using Oko.Pcapng;
@@ -10,8 +11,8 @@ namespace Oko.Capture;
 /// </summary>
 /// <remarks>
 /// A segment is written once <see cref="OkoOptions.FlushBytes"/> has accumulated, or
-/// <see cref="OkoOptions.FlushInterval"/> has passed since the first pending block — the timer is what
-/// makes a quiet link still reach disk instead of sitting in memory indefinitely.
+/// <see cref="OkoOptions.FlushInterval"/> has passed since the first packet arrived at the collector.
+/// Sealing a block does not restart that deadline. Idle polling, scheduling and disk I/O add latency.
 /// </remarks>
 internal sealed class SegmentWriter(
     OkoOptions options,
@@ -21,6 +22,32 @@ internal sealed class SegmentWriter(
 {
     /// <summary>How long to wait before retrying after a failed write.</summary>
     private static readonly TimeSpan WriteRetryDelay = TimeSpan.FromSeconds(5);
+
+    private readonly List<CaptureBlock> _pending = [];
+    private readonly Lock _stopGate = new();
+    private Task? _stopTask;
+
+    /// <summary>
+    /// Stops the worker, then drains once. In .NET 10 cancellation can prevent ExecuteAsync from ever
+    /// being called, so the final drain must belong to the hosted-service lifecycle instead.
+    /// </summary>
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        lock (_stopGate)
+        {
+            // A host timeout stops waiting, but must not start a concurrent drain while the worker
+            // still owns pending blocks or an in-flight write. Later stop calls await the same drain.
+            _stopTask ??= StopAndDrainAsync();
+            return _stopTask.WaitAsync(cancellationToken);
+        }
+    }
+
+    private async Task StopAndDrainAsync()
+    {
+        await base.StopAsync(CancellationToken.None).ConfigureAwait(false);
+        Debug.Assert(ExecuteTask is null || ExecuteTask.IsCompleted);
+        await DrainOnShutdownAsync(store.FlushQueue, _pending).ConfigureAwait(false);
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -39,20 +66,20 @@ internal sealed class SegmentWriter(
     }
 
     /// <summary>
-    /// Seals the active block once its oldest packet exceeds the flush interval, so data reaches disk on
-    /// a schedule rather than only when a block happens to fill.
+    /// Seals the active block once its first arrival exceeds the flush interval, so data reaches disk
+    /// on a schedule rather than only when a block happens to fill.
     /// </summary>
     private async Task SealIdleBlocksAsync(CancellationToken stoppingToken)
     {
         // Checking several times per interval keeps the actual delay close to the configured one.
         TimeSpan period = TimeSpan.FromMilliseconds(Math.Max(250, options.FlushInterval.TotalMilliseconds / 4));
-        using var timer = new PeriodicTimer(period);
+        using var timer = new PeriodicTimer(period, store.TimeProvider);
 
         try
         {
             while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false))
             {
-                if (store.SealActiveIfOlderThan(options.FlushInterval, DateTime.UtcNow))
+                if (store.SealActiveIfOlderThan(options.FlushInterval))
                 {
                     logger.LogDebug("Sealed a partially-filled block after {Interval}.", options.FlushInterval);
                 }
@@ -67,35 +94,32 @@ internal sealed class SegmentWriter(
     private async Task WriteLoopAsync(CancellationToken stoppingToken)
     {
         ChannelReader<CaptureBlock> reader = store.FlushQueue;
-        var pending = new List<CaptureBlock>();
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            if (!await TryAccumulateAsync(reader, pending, stoppingToken).ConfigureAwait(false))
+            if (!await TryAccumulateAsync(reader, _pending, stoppingToken).ConfigureAwait(false))
             {
                 break;
             }
 
-            if (await TryWriteSegmentAsync(pending).ConfigureAwait(false))
+            if (await TryWriteSegmentAsync(_pending).ConfigureAwait(false))
             {
-                pending.Clear();
                 continue;
             }
 
-            // Keep the blocks: they stay queryable from memory and get retried with whatever else has
-            // arrived by then. If storage is genuinely broken this grows memory, which CaptureStore
+            // Keep the blocks: they stay queryable from memory and get retried after a delay.
+            // If storage is genuinely broken this grows memory, which CaptureStore
             // reports loudly — better than discarding capture data quietly.
             try
             {
-                await Task.Delay(WriteRetryDelay, stoppingToken).ConfigureAwait(false);
+                logger.LogWarning("Retrying pending capture write in {Delay}.", WriteRetryDelay);
+                await Task.Delay(WriteRetryDelay, store.TimeProvider, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
         }
-
-        await DrainOnShutdownAsync(reader, pending).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -120,18 +144,23 @@ internal sealed class SegmentWriter(
         }
 
         long pendingBytes = pending.Sum(block => (long)block.Length);
-        DateTime deadline = DateTime.UtcNow + options.FlushInterval;
+        // The store seals nonempty blocks in append order and this is its only queue reader. Keeping
+        // the first block across retries also keeps the original deadline; retries must not reset it.
+        Debug.Assert(pending.Count > 0);
+        Debug.Assert(pending.All(block => block.PacketCount > 0));
+        Debug.Assert(pending.All(block => block.FirstArrivalTimestamp >= pending[0].FirstArrivalTimestamp));
+        long firstArrival = pending[0].FirstArrivalTimestamp;
 
         while (pendingBytes < options.FlushBytes)
         {
-            TimeSpan remaining = deadline - DateTime.UtcNow;
+            TimeSpan remaining = options.FlushInterval - store.TimeProvider.GetElapsedTime(firstArrival);
             if (remaining <= TimeSpan.Zero)
             {
                 break;
             }
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            timeout.CancelAfter(remaining);
+            using var deadlineTimer = new CancellationTokenSource(remaining, store.TimeProvider);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, deadlineTimer.Token);
 
             try
             {
@@ -165,19 +194,24 @@ internal sealed class SegmentWriter(
         }
 
         logger.LogInformation("Flushing {Count} pending block(s) before shutdown.", pending.Count);
-        await TryWriteSegmentAsync(pending).ConfigureAwait(false);
+        if (!await TryWriteSegmentAsync(pending).ConfigureAwait(false))
+        {
+            logger.LogError("Shutdown flush failed; {Count} block(s) remain only in memory.", pending.Count);
+        }
     }
 
     /// <summary>
-    /// Writes one segment. Deliberately takes no cancellation token: an in-flight segment is at most a
-    /// few megabytes and always finishes, so shutdown can never leave a half-written file behind or
-    /// abandon captured data. Cancellation is honoured between segments instead.
+    /// Writes one segment and clears the committed blocks from the pending list before logging.
+    /// Runs without cancellation, allowing in-flight I/O to finish during graceful shutdown. Only
+    /// complete files are renamed into place. A forced process exit or storage failure can still lose
+    /// memory-only data; the host's shutdown timeout does not guarantee a disk flush.
     /// </summary>
     private async Task<bool> TryWriteSegmentAsync(List<CaptureBlock> blocks)
     {
         List<CaptureBlock> populated = [.. blocks.Where(block => block.PacketCount > 0)];
         if (populated.Count == 0)
         {
+            blocks.Clear();
             return true;
         }
 
@@ -217,9 +251,8 @@ internal sealed class SegmentWriter(
         {
             logger.LogError(
                 exception,
-                "Failed to write segment {Path}; will retry in {Delay}. Data stays in memory until then.",
-                path,
-                WriteRetryDelay);
+                "Failed to write segment {Path}. Capture data remains in memory.",
+                path);
 
             TryDeleteTemporary(temporaryPath);
             return false;
@@ -227,6 +260,9 @@ internal sealed class SegmentWriter(
 
         long size = new FileInfo(path).Length;
         store.CompleteFlush(populated, new SegmentRef(path, startUtc, endUtc, size, number));
+        // Committed blocks must no longer be eligible for the shutdown drain, even if a logging
+        // provider throws below. The separate populated list still supplies the log's packet count.
+        blocks.Clear();
 
         logger.LogInformation(
             "Wrote {Path} ({Bytes} bytes, {Packets} packets, {Start:HH:mm:ss.fff}-{End:HH:mm:ss.fff}Z).",

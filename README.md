@@ -318,7 +318,7 @@ falling back to a default you did not ask for.
 | `OKO_UDP_BIND` | `0.0.0.0` | Applies to both listeners; `0.0.0.0` binds dual-stack |
 | `OKO_DATA_DIR` | `/data` | Segments and the interface table |
 | `OKO_FLUSH_BYTES` | `8388608` | Accumulated bytes that trigger a segment write |
-| `OKO_FLUSH_INTERVAL` | `00:01:00` | Upper bound on how long data stays only in memory |
+| `OKO_FLUSH_INTERVAL` | `00:01:00` | Segment write deadline from first collector arrival; see timing below |
 | `OKO_BLOCK_BYTES` | `1048576` | In-memory block size (minimum 128 KB) |
 | `OKO_SNAPLEN` | `0` | Truncate frames to this many bytes; `0` keeps everything |
 | `OKO_RETENTION_BYTES` | `53687091200` | 50 GB |
@@ -328,6 +328,21 @@ falling back to a default you did not ask for.
 | `OKO_LIVE_MAX_SUBSCRIBERS` | `8` | Concurrent live readers |
 
 `ASPNETCORE_URLS` controls the HTTP listener (default `http://+:8080`).
+
+`OKO_FLUSH_INTERVAL` starts when the first packet enters an in-memory block. Sealing that block,
+receiving more packets or retrying a failed write does not restart its deadline. Flush scheduling uses
+the collector's monotonic clock; sender timestamps remain unchanged in the pcapng and still determine
+capture time ranges.
+
+With healthy storage, a quiet capture becomes due after one interval, plus up to one idle polling
+period (`max(250 ms, interval / 4)`), task scheduling and disk I/O time. At the default setting that is
+60–75 seconds before scheduling and I/O overhead. This is not a hard durability guarantee: failed writes
+retain data in memory and retry after five seconds, and a forced process exit can lose unflushed data.
+
+Graceful shutdown stops ingest before draining queued and partially filled blocks. The writer also
+drains if shutdown prevented its background task from starting. In-flight writes finish before the
+final drain; an expired host shutdown timeout ends the wait and cannot guarantee persistence. A failed
+final flush is logged explicitly.
 
 ---
 
@@ -461,6 +476,14 @@ and live-only HTTP readers, validating the resulting captures with Wireshark. Ru
 
 ```bash
 dotnet test -- --filter-class 'Oko.Tests.Live*'
+```
+
+Writer regressions use a fake collector clock to check one-interval persistence, sender and local clock
+skew, size-triggered writes and storage retry timing. They also cover cancellation before the worker
+starts and shutdown during a write, with resulting captures checked using Wireshark:
+
+```bash
+dotnet test -- --filter-class 'Oko.Tests.SegmentWriterTests'
 ```
 
 Wireshark-dependent tests skip when `tshark` or `capinfos` is missing; check the skipped count before
