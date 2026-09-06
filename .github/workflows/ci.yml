@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version-bump check needs the base branch
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # The suite validates every capture file it writes against the real Wireshark tools; that check
+      # is the point of the suite, not an extra. DEBIAN_FRONTEND stops the tshark package prompting
+      # about non-root capture and hanging the run.
+      - name: Install Wireshark CLI tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          tshark --version | head -1
+          capinfos --version | head -1
+
+      - run: dotnet build Oko.slnx --configuration Release
+
+      # --fail-skips on: a skipped Wireshark test would otherwise look like a pass.
+      - run: dotnet test Oko.slnx --configuration Release --no-build -- --fail-skips on
+
+      - name: Check oko-tap still injects its self-exclusion filter
+        run: |
+          out=$(./tools/oko-tap/oko-tap --collector 10.0.0.5 --filter 'host 10.0.0.5' --dry-run)
+          echo "$out"
+          case "$out" in
+            *"not (host 10.0.0.5 and tcp port 37009)"*) echo "exclusion present" ;;
+            *) echo "::error::oko-tap lost its self-exclusion filter; this would cause a capture feedback loop"; exit 1 ;;
+          esac
+
+      # A note, not a gate: plenty of PRs legitimately touch src/ without releasing.
+      - name: Note whether a version bump accompanies the code change
+        run: |
+          version=$(sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p' Directory.Build.props)
+          base=$(git show "origin/${{ github.base_ref || 'main' }}:Directory.Build.props" 2>/dev/null \
+                 | sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p')
+          changed=$(git diff --name-only "origin/${{ github.base_ref || 'main' }}...HEAD" -- src/ Dockerfile | wc -l)
+          {
+            echo "### Release readiness"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version on base | \`${base:-unknown}\` |"
+            echo "| Version here | \`$version\` |"
+            echo "| Shipped files changed | $changed |"
+            echo ""
+            if [ "$changed" -gt 0 ] && [ "$version" = "$base" ]; then
+              echo ":warning: This PR changes shipped code but leaves \`<OkoVersion>\` at \`$version\`."
+              echo "Merging will publish only the rolling \`edge\` tag, not a new release."
+              echo "Bump \`<OkoVersion>\` in \`Directory.Build.props\` if you want a versioned release."
+            elif [ "$version" != "$base" ]; then
+              echo ":rocket: Merging will tag \`v$version\` and publish \`$version\` + \`latest\`."
+            else
+              echo "No shipped code changed; merging will refresh \`edge\` only."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

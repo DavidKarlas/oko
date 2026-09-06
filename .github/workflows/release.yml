@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  # Decide first, publish second, tag last. Tagging before publishing would leave an orphan tag
+  # pointing at code that never shipped if the push then failed.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags, so we can tell whether this version was already released
+
+      - name: Decide whether this merge is a release
+        id: decide
+        run: |
+          version=$(sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p' Directory.Build.props)
+          if [ -z "$version" ]; then
+            echo "::error::could not read <OkoVersion> from Directory.Build.props"; exit 1
+          fi
+
+          release=true
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "Tag v$version already exists."
+            release=false
+          fi
+
+          # The registry is the real source of truth for what has shipped: the repo had no tags at all
+          # while 0.1.0 and 0.1.1 were already on Docker Hub.
+          image="${{ vars.DOCKERHUB_IMAGE || 'davidkarlas/oko' }}"
+          if [ "$release" = "true" ] && docker manifest inspect "$image:$version" >/dev/null 2>&1; then
+            echo "::warning::$image:$version is already published; refreshing edge instead of re-releasing."
+            release=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+          {
+            if [ "$release" = "true" ]; then
+              echo "### Releasing \`v$version\`"
+              echo ""
+              echo "Publishing \`$version\` + \`latest\`, then tagging \`v$version\`."
+            else
+              echo "### No new version"
+              echo ""
+              echo "\`<OkoVersion>\` is \`$version\`, which is already released. Refreshing \`edge\` only."
+              echo "Bump \`<OkoVersion>\` in \`Directory.Build.props\` to cut a release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: plan
+    uses: ./.github/workflows/publish.yml
+    with:
+      version: ${{ needs.plan.outputs.version }}
+      release: ${{ needs.plan.outputs.release == 'true' }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # Only once the image is really on Docker Hub, so a tag always corresponds to something published.
+  #
+  # Note this tag is pushed with GITHUB_TOKEN, which by design does NOT trigger other workflows —
+  # GitHub suppresses that to prevent recursion. That is exactly why publish runs as a called workflow
+  # above rather than waiting for this tag event; otherwise merges would mint tags and silently never
+  # publish. The v* trigger in publish.yml still works for tags you push yourself.
+  tag:
+    needs: [plan, publish]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag the released commit
+        run: |
+          version="${{ needs.plan.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$version" -m "Oko v$version"
+          git push origin "v$version"
+          echo "Tagged v$version at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"

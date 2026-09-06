@@ -73,7 +73,7 @@ curl http://127.0.0.1:8080/healthz     # -> ok
 
 Published for `linux/amd64` and `linux/arm64`, so it runs on ordinary x86 servers as well as on ARM
 (Raspberry Pi, Ampere, Graviton, Apple Silicon). Pin a version for anything you care about:
-`davidkarlas/oko:0.1.1`.
+`davidkarlas/oko:0.1.2`.
 
 Why host networking matters on Linux: see
 [the Docker note](#1-publishing-ingest-ports-through-dockers-bridge-breaks-sensor-attribution).
