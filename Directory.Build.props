@@ -8,7 +8,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AnalysisLevel>latest</AnalysisLevel>
-    <OkoVersion>0.1.2</OkoVersion>
+    <OkoVersion>0.1.3</OkoVersion>
     <Version>$(OkoVersion)</Version>
   </PropertyGroup>
 
