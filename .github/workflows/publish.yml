@@ -1,0 +1,149 @@
+name: Publish
+
+# Three ways in:
+#   * a v* tag pushed by hand          -> release that version
+#   * called by release.yml on merge   -> release, or refresh edge
+#   * run manually from the Actions UI -> release a chosen version
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 0.1.2'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      release:
+        description: 'true tags version+latest; false refreshes edge only'
+        required: true
+        type: boolean
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+concurrency:
+  group: publish-${{ inputs.version || github.ref }}
+  cancel-in-progress: false   # never abandon a half-finished push
+
+env:
+  IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'davidkarlas/oko' }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Install Wireshark CLI tools
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+
+      # The gate. Nothing reaches Docker Hub without the suite passing, and a skipped Wireshark test
+      # counts as a failure rather than a quiet pass.
+      - name: Build and test
+        run: |
+          dotnet build Oko.slnx --configuration Release
+          dotnet test Oko.slnx --configuration Release --no-build -- --fail-skips on
+
+      - name: Work out version and tags
+        id: plan
+        run: |
+          # Deliberately NOT keyed on github.event_name: inside a reusable workflow that reports the
+          # CALLER's event, so a release.yml call (triggered by push-to-main) would look like a tag push
+          # and derive the version from the branch name. Presence of inputs is the reliable signal.
+          version="${{ inputs.version }}"
+          release="${{ inputs.release }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF_NAME#v}"   # a v* tag someone pushed by hand
+            release=true
+          fi
+          [ -n "$release" ] || release=true  # workflow_dispatch has no release input
+
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::'$version' does not look like x.y.z"; exit 1 ;;
+          esac
+
+          # The version stamped into every capture file comes from Directory.Build.props, so a tag that
+          # disagrees with it would produce files that misreport what wrote them.
+          declared=$(sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p' Directory.Build.props)
+          if [ "$release" = "true" ] && [ "$declared" != "$version" ]; then
+            echo "::error::tag says $version but Directory.Build.props says $declared"
+            exit 1
+          fi
+
+          if [ "$release" = "true" ]; then
+            tags="${IMAGE}:${version},${IMAGE}:latest"
+          else
+            tags="${IMAGE}:edge"
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags"       >> "$GITHUB_OUTPUT"
+          echo "Publishing $tags"
+
+      # Refuse to move a version tag that already exists: someone may have pinned it, and silently
+      # changing what it points at defeats the purpose of pinning.
+      - name: Refuse to overwrite an existing released tag
+        if: steps.plan.outputs.release == 'true'
+        run: |
+          if docker manifest inspect "${IMAGE}:${{ steps.plan.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${{ steps.plan.outputs.version }} is already published. Bump <OkoVersion>."
+            exit 1
+          fi
+          echo "Tag is free."
+
+      # No QEMU step on purpose: the Dockerfile pins its SDK stage to $BUILDPLATFORM and cross-compiles
+      # with 'dotnet publish -a', so the foreign architecture is never emulated.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.plan.outputs.tags }}
+          build-args: |
+            OKO_VERSION=${{ steps.plan.outputs.version }}
+            OKO_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify both architectures really landed
+        run: |
+          primary="${IMAGE}:$([ "${{ steps.plan.outputs.release }}" = "true" ] && echo "${{ steps.plan.outputs.version }}" || echo edge)"
+          manifest=$(docker buildx imagetools inspect "$primary")
+          echo "$manifest"
+          for platform in linux/amd64 linux/arm64; do
+            echo "$manifest" | grep -qE "Platform:[[:space:]]+${platform}([[:space:]]|$)" \
+              || { echo "::error::$platform missing from $primary"; exit 1; }
+            echo "  $platform present"
+          done
+          {
+            echo "### Published"
+            echo ""
+            echo '```'
+            echo "docker pull $primary"
+            echo '```'
+            echo ""
+            echo "Tags: \`${{ steps.plan.outputs.tags }}\` — revision \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
