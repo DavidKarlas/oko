@@ -3,6 +3,17 @@ name: Release
 on:
   push:
     branches: [main]
+  # One-click release: bump, publish and tag in a single run. It has to be one run because a commit
+  # pushed with GITHUB_TOKEN does not trigger workflows, so a separate "bump" workflow would push the
+  # version and then nothing would happen.
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version part to increment'
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
 
 concurrency:
   group: release-main
@@ -13,17 +24,50 @@ jobs:
   # pointing at code that never shipped if the push then failed.
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the manual path commits the version bump
     outputs:
       version: ${{ steps.decide.outputs.version }}
       release: ${{ steps.decide.outputs.release }}
+      ref: ${{ steps.decide.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # tags, so we can tell whether this version was already released
+          ref: main
 
-      - name: Decide whether this merge is a release
+      - name: Bump the version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p' Directory.Build.props)
+          case "$current" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::current version '$current' is not x.y.z"; exit 1 ;;
+          esac
+
+          major=${current%%.*}; rest=${current#*.}; minor=${rest%%.*}; patch=${rest#*.}
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="$major.$minor.$patch"
+          echo "Bumping $current -> $next"
+
+          sed -i "s|<OkoVersion>$current</OkoVersion>|<OkoVersion>$next</OkoVersion>|" Directory.Build.props
+          # Keep the README's pin example current. Tolerated if the wording moves on.
+          sed -i "s|davidkarlas/oko:$current|davidkarlas/oko:$next|g" README.md || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -am "Release $next"
+          git push origin HEAD:main
+
+      - name: Decide whether this run is a release
         id: decide
         run: |
+          set -euo pipefail
           version=$(sed -n 's/.*<OkoVersion>\(.*\)<\/OkoVersion>.*/\1/p' Directory.Build.props)
           if [ -z "$version" ]; then
             echo "::error::could not read <OkoVersion> from Directory.Build.props"; exit 1
@@ -43,19 +87,24 @@ jobs:
             release=false
           fi
 
+          # Publish and tag must use the commit this job settled on, which on the manual path is the
+          # bump commit rather than the SHA that triggered the run.
+          ref=$(git rev-parse HEAD)
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref"         >> "$GITHUB_OUTPUT"
 
           {
             if [ "$release" = "true" ]; then
               echo "### Releasing \`v$version\`"
               echo ""
-              echo "Publishing \`$version\` + \`latest\`, then tagging \`v$version\`."
+              echo "Publishing \`$version\` + \`latest\` from \`${ref:0:7}\`, then tagging \`v$version\`."
             else
               echo "### No new version"
               echo ""
               echo "\`<OkoVersion>\` is \`$version\`, which is already released. Refreshing \`edge\` only."
-              echo "Bump \`<OkoVersion>\` in \`Directory.Build.props\` to cut a release."
+              echo "Run this workflow manually to bump and release."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -65,6 +114,7 @@ jobs:
     with:
       version: ${{ needs.plan.outputs.version }}
       release: ${{ needs.plan.outputs.release == 'true' }}
+      ref: ${{ needs.plan.outputs.ref }}
     secrets:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -83,6 +133,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
 
       - name: Tag the released commit
         run: |
@@ -91,4 +143,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v$version" -m "Oko v$version"
           git push origin "v$version"
-          echo "Tagged v$version at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tagged v$version at ${{ needs.plan.outputs.ref }}" >> "$GITHUB_STEP_SUMMARY"
