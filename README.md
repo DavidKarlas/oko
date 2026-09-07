@@ -456,6 +456,58 @@ pcap / TCP path:
 
 ---
 
+## Prometheus, VictoriaMetrics and Grafana
+
+`GET /metrics` exports [Prometheus text format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/).
+It uses the same access tokens as capture routes, supplied with a bearer header:
+
+```bash
+curl -H "Authorization: Bearer $OKO_TOKEN" http://localhost:8080/metrics
+```
+
+Use one configured token for `OKO_TOKEN`, not the comma-separated `OKO_TOKENS` list.
+Missing or invalid credentials return 404; no configured tokens returns 503.
+`OKO_ALLOW_ANONYMOUS=true` also makes metrics public.
+
+Copy [monitoring/prometheus.yml](monitoring/prometheus.yml) into your scrape configuration,
+change the target to your collector, and put one token in the referenced credentials file on the
+scraper. Use `scheme: https` when scraping through the TLS proxy. The same scrape configuration works
+with [vmagent or single-node VictoriaMetrics](https://docs.victoriametrics.com/victoriametrics/vmagent/)
+using `-promscrape.config=/path/to/prometheus.yml`.
+
+Import [monitoring/grafana-dashboard.json](monitoring/grafana-dashboard.json) into Grafana and select
+a Prometheus datasource pointing at Prometheus or VictoriaMetrics. Select the job and collector
+instances using the dashboard filters. It includes capture and per-sensor rates, pending writes,
+retention usage, historical coverage, drops, live readers, writer health and scrape availability.
+
+Metric names use the `oko_` prefix. Counters end in `_total` and reset on process restart; use
+`rate(metric[5m])` for rates and `increase(metric[5m])` for counts over a window. For example:
+
+```promql
+rate(oko_stored_frames_total[5m])
+8 * rate(oko_stored_bytes_total[5m])
+oko_memory_active_bytes + oko_memory_pending_flush_bytes
+increase(oko_writer_failures_total[5m])
+```
+
+`stored` means accepted into memory, not persisted. `oko_writer_bytes_total` counts committed file
+bytes, including headers. Flush duration totals cover successful writes only; divide their rate by
+`rate(oko_writer_flushes_total[5m])` for mean duration. Last-success time is zero before the first flush;
+an idle collector need not flush, so interpret its age alongside pending bytes.
+
+Storage bytes count indexed segments, not total filesystem usage. The oldest timestamp and sensor
+last-seen timestamps come from capture time; a TCP sender with a skewed clock affects them.
+`oko_clock_skew_events_total` counts warnings (once per affected TCP connection), not unique sensors.
+`oko_udp_socket_drops_total` is omitted when the kernel counter is unavailable, rather than reporting
+zero. Live overflow counts disconnected readers, not lost packets.
+
+Only per-sensor metrics have labels (`sensor`, `link_type`), with three series per observed pair.
+They remain for the lifetime of the process, so deployments with continually changing sender addresses
+should account for that cardinality. Tokens, paths and connection IDs are never metric labels.
+`/status` remains available for ad hoc diagnostics.
+
+---
+
 ## Development
 
 Requires the .NET 10 SDK, and Wireshark for the tests (`tshark` and `capinfos` are used to validate

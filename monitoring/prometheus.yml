@@ -1,0 +1,11 @@
+# Also accepted by vmagent / single-node VictoriaMetrics via -promscrape.config.
+scrape_configs:
+  - job_name: oko
+    scrape_interval: 15s
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/oko-token
+    static_configs:
+      - targets: ['oko:8080']
