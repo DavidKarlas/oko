@@ -568,6 +568,26 @@ useful for simulating several routers, and what a real sensor behind NAT would d
 
 ### Releasing
 
+**Actions → Release → Run workflow → pick `patch`, `minor` or `major`.**
+
+That single run bumps `<OkoVersion>`, commits it, publishes `linux/amd64` + `linux/arm64` to Docker Hub
+as both the version and `latest`, and tags the released commit. Nothing to check out or edit.
+
+It has to be one run rather than a separate "bump" workflow: a commit pushed with `GITHUB_TOKEN` does
+not trigger workflows, so a bump on its own would push the version and then sit there.
+
+Merging to `main` still releases automatically **when the version changed**, and otherwise refreshes the
+rolling `edge` tag. So a contributor who forgets to bump does not silently ship nothing — their work
+lands in `edge`, and a manual run turns it into a release.
+
+| Tag | What it is |
+|---|---|
+| `latest` | the newest released version |
+| `0.1.3` | an immutable release; the workflow refuses to overwrite one |
+| `edge` | current `main`, refreshed on every merge, no version guarantee |
+
+There is also `scripts/publish.sh` for publishing from a laptop, which the workflow does not use:
+
 ```bash
 docker login                          # once, interactively
 ./scripts/publish.sh --dry-run        # build both architectures, push nothing
@@ -582,8 +602,10 @@ The build **cross-compiles** rather than emulating: the SDK stage is pinned to `
 `dotnet publish -a` targets the other architecture. Emulating an x86 SDK under QEMU on an ARM machine
 takes minutes per platform; this takes about 13 seconds each.
 
-To bump the version, edit `<OkoVersion>` in `Directory.Build.props` — it feeds the assembly version, the
-`shb_userappl` string recorded in every capture file, and the image tag.
+`<OkoVersion>` in `Directory.Build.props` is the single source of truth: it feeds the assembly version,
+the `shb_userappl` string recorded in every capture file, the git tag and the image tag. The publish
+workflow refuses to build if a tag and that value disagree, so a release can never produce capture files
+that misreport the version that wrote them.
 
 ---
 
